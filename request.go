@@ -62,7 +62,7 @@ func Query(query string) *Request {
 		Language: "gremlin-groovy",
 	}
 	req := &Request{
-		RequestId: uuid.NewV4().String(),
+		RequestId: uuid.Must(uuid.NewV4()).String(),
 		Op:        "eval",
 		Processor: "",
 		Args:      args,
