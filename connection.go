@@ -12,26 +12,83 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/jessicacglenn/pool"
+
+	"sync"
 )
 
 // Clients include the necessary info to connect to the server and the underlying socket
 type Client struct {
-	Remote *url.URL
-	Ws     *websocket.Conn
-	Auth   []OptAuth
+	Remote 		*url.URL
+	servchan	chan *sync.Map
+	pool		pool.Pool
+	endpointmap	*sync.Map
+	mu			*sync.RWMutex
+	Auth   		[]OptAuth
+
 }
 
+
+
+var (
+	MalformedClusterStringErr = errors.New("connection string is not in expected format. An example of the expected format is 'ws://server1:8182, ws://server2:8182'")
+	UserNotSetErr = errors.New("variable GREMLIN_USER is not set")
+	PassNotSetErr = errors.New("variable GREMLIN_PASS is not set")
+	UnknownErr = errors.New("an unknown error occurred")
+	NoEndpointsError = errors.New("no valid endpoints provided")
+)
+
+// perhaps if we change the urlStr to interface{} we can have either a slice or a string passed through and
+// we will be able to use this for both the
 func NewClient(urlStr string, options ...OptAuth) (*Client, error) {
-	r, err := url.Parse(urlStr)
+
+	em, ec, err := newEndpointsChannel(urlStr)
+	if err != nil {
+		return nil, err
+	}
+
+	c := &Client{Auth: options, endpointmap: em, servchan: ec, mu: &sync.RWMutex{}}
+
+	factory    := func() (*websocket.Conn, error) { return c.connectSocket(ec) }
+	p, err := pool.NewChannelPool(1, 30, factory)
+	if err != nil {
+		return nil, err
+	}
+	c.pool = p
+	return c, nil
+}
+
+
+
+
+// if the server is not reachable then we should mark it as unavailable
+// and then try again a little later.
+
+func (c *Client) connectSocket(ch chan *sync.Map) (*websocket.Conn, error) {
+	// lock the client while finding the endpoint
+	//c.mu.Lock()
+	endpoint, err := findValidEndpoint(ch, c.mu)
+	//c.mu.Unlock()
+
+	if err != nil {
+		return nil, err
+	}
+	urlStr, err := urlStrForEndpoint(endpoint)
 	if err != nil {
 		return nil, err
 	}
 	dialer := websocket.Dialer{}
 	ws, _, err := dialer.Dial(urlStr, http.Header{})
 	if err != nil {
-		return nil, err
+		putEndpointOnIce(endpoint)
+		return c.connectSocket(ch)
 	}
-	return &Client{Remote: r, Ws: ws, Auth: options}, nil
+	return ws, err
+}
+
+
+func (c *Client) Close() {
+	c.pool.Close()
 }
 
 // Client executes the provided request
@@ -41,27 +98,34 @@ func (c *Client) ExecQuery(query string) ([]byte, error) {
 }
 
 func (c *Client) Exec(req *Request) ([]byte, error) {
+	con, err := c.pool.Get()
+	if err != nil {
+		return nil, err
+	}
+	return c.executeForConn(req, con)
+}
+
+func (c *Client) executeForConn(req *Request, con *pool.PoolConn) ([]byte, error) {
 	requestMessage, err := GraphSONSerializer(req)
 	if err != nil {
 		return nil, err
 	}
 
-	// Open a TCP connection
-	if err = c.Ws.WriteMessage(websocket.BinaryMessage, requestMessage); err != nil {
+	if err := con.WriteMessage(websocket.BinaryMessage, requestMessage); err != nil {
 		print("error", err)
 		return nil, err
 	}
-	return c.ReadResponse()
+	return c.ReadResponse(con)
 }
 
-func (c *Client) ReadResponse() (data []byte, err error) {
+func (c *Client) ReadResponse(con *pool.PoolConn) (data []byte, err error) {
 	// Data buffer
 	var message []byte
 	var dataItems []json.RawMessage
 	inBatchMode := false
 	// Receive data
 	for {
-		if _, message, err = c.Ws.ReadMessage(); err != nil {
+		if _, message, err = con.ReadMessage(); err != nil {
 			return
 		}
 		var res *Response
@@ -71,16 +135,22 @@ func (c *Client) ReadResponse() (data []byte, err error) {
 		var items []json.RawMessage
 		switch res.Status.Code {
 		case StatusNoContent:
+			// close the connection and put it back to the pool
+			con.Close()
 			return
 
 		case StatusAuthenticate:
-			return c.Authenticate(res.RequestId)
+			// close the connection and put it back to the pool
+			con.Close()
+			return c.authenticate(con, res.RequestId)
 		case StatusPartialContent:
 			inBatchMode = true
 			if err = json.Unmarshal(res.Result.Data, &items); err != nil {
 				return
 			}
 			dataItems = append(dataItems, items...)
+			// close the connection and put it back to the pool
+			con.Close()
 
 		case StatusSuccess:
 			if inBatchMode {
@@ -92,19 +162,40 @@ func (c *Client) ReadResponse() (data []byte, err error) {
 			} else {
 				data = res.Result.Data
 			}
+			val, ex := c.endpointmap.Load(con.RemoteAddr().String())
+			if ex {
+				sm := val.(*sync.Map)
+				reduceErrorScore(sm)
+			}
+
+			// close the connection and put it back to the pool
+			con.Close()
 			return
 
 		default:
-			if msg, exists := ErrorMsg[res.Status.Code]; exists {
-				err = errors.New(msg)
+			if errmsg, exists := ConnectionErrors[res.Status.Code]; exists {
+				err = errmsg
 			} else {
-				err = errors.New("An unknown error occured")
+				err = UnknownErr
+			}
+
+			// mark the connection as unusable so that the pool has to spin a new one up
+			con.MarkUnusable()
+			con.Close()
+
+			val, ex := c.endpointmap.Load(con.RemoteAddr().String())
+			if ex {
+				sm := val.(*sync.Map)
+				putEndpointOnIce(sm)
 			}
 			return
 		}
 	}
+	// close the connection and put it back to the pool
+	con.Close()
 	return
 }
+
 
 // AuthInfo includes all info related with SASL authentication with the Gremlin server
 // ChallengeId is the  requestID in the 407 status (AUTHENTICATE) response given by the server.
@@ -134,11 +225,11 @@ func OptAuthEnv() OptAuth {
 	return func(auth *AuthInfo) error {
 		user, ok := os.LookupEnv("GREMLIN_USER")
 		if !ok {
-			return errors.New("Variable GREMLIN_USER is not set")
+			return UserNotSetErr
 		}
 		pass, ok := os.LookupEnv("GREMLIN_PASS")
 		if !ok {
-			return errors.New("Variable GREMLIN_PASS is not set")
+			return PassNotSetErr
 		}
 		auth.User = user
 		auth.Pass = pass
@@ -155,8 +246,8 @@ func OptAuthUserPass(user, pass string) OptAuth {
 	}
 }
 
-// Authenticates the connection
-func (c *Client) Authenticate(requestId string) ([]byte, error) {
+
+func (c *Client) authenticate(con *pool.PoolConn, requestId string) ([]byte, error) {
 	auth, err := NewAuthInfo(c.Auth...)
 	if err != nil {
 		return nil, err
@@ -174,8 +265,12 @@ func (c *Client) Authenticate(requestId string) ([]byte, error) {
 		Op:        "authentication",
 		Args:      args,
 	}
-	return c.Exec(authReq)
+	return c.executeForConn(authReq, con)
 }
+
+
+// todo : find out if this is something we can remove altogether or if we need to be able
+// to support the un-load-balanced gremlin servers
 
 var servers []*url.URL
 
@@ -202,21 +297,7 @@ func NewCluster(s ...string) (err error) {
 	return
 }
 
-func SplitServers(connString string) (servers []*url.URL, err error) {
-	serverStrings := strings.Split(connString, ",")
-	if len(serverStrings) < 1 {
-		err = errors.New("Connection string is not in expected format. An example of the expected format is 'ws://server1:8182, ws://server2:8182'.")
-		return
-	}
-	for _, serverString := range serverStrings {
-		var u *url.URL
-		if u, err = url.Parse(strings.TrimSpace(serverString)); err != nil {
-			return
-		}
-		servers = append(servers, u)
-	}
-	return
-}
+
 
 func CreateConnection() (conn net.Conn, server *url.URL, err error) {
 	connEstablished := false
