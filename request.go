@@ -4,6 +4,12 @@ import (
 	"encoding/json"
 	_ "fmt"
 	"github.com/satori/go.uuid"
+	"errors"
+)
+
+
+var (
+	NoClusterError = errors.New("no cluster to query, consider setting up a cluster or client")
 )
 
 type Request struct {
@@ -93,4 +99,12 @@ func (req *Request) Session(session string) *Request {
 func (req *Request) SetProcessor(processor string) *Request {
 	req.Processor = processor
 	return req
+}
+
+// Adding this in for backwards compatability.
+func (req *Request) Exec() (data []byte, err error) {
+	if defaultClient == nil {
+		return nil, NoClusterError
+	}
+	return defaultClient.Exec(req)
 }

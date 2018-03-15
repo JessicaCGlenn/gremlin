@@ -48,3 +48,16 @@ func TestReadWrite(t *testing.T) {
 	assert.Empty(t, res)
 }
 
+
+// legacy query
+func TestLegacyQuery(t *testing.T) {
+	NewCluster(testendpoint)
+	testquery := "1 + 1"
+	req := Query(testquery)
+	data, err := req.Exec()
+	assert.Empty(t, err)
+	var m []map[string]interface{}
+	err = json.Unmarshal(data, &m)
+	assert.Empty(t, err)
+	assert.Equal(t, 2.0, m[0]["@value"])
+}

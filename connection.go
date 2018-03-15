@@ -4,13 +4,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
-	"time"
-
 	"github.com/gorilla/websocket"
 	"github.com/jessicacglenn/pool"
 
@@ -36,6 +33,7 @@ var (
 	PassNotSetErr = errors.New("variable GREMLIN_PASS is not set")
 	UnknownErr = errors.New("an unknown error occurred")
 	NoEndpointsError = errors.New("no valid endpoints provided")
+	NoServersSetError = errors.New("no servers set, configure servers to connect to using the GREMLIN_SERVERS environment variable")
 )
 
 // perhaps if we change the urlStr to interface{} we can have either a slice or a string passed through and
@@ -269,50 +267,22 @@ func (c *Client) authenticate(con *pool.PoolConn, requestId string) ([]byte, err
 }
 
 
-// todo : find out if this is something we can remove altogether or if we need to be able
-// to support the un-load-balanced gremlin servers
+// LEGACY
 
-var servers []*url.URL
+var defaultClient *Client
 
 func NewCluster(s ...string) (err error) {
-	servers = nil
+	var connString string
 	// If no arguments use environment variable
 	if len(s) == 0 {
-		connString := strings.TrimSpace(os.Getenv("GREMLIN_SERVERS"))
-		if connString == "" {
-			err = errors.New("No servers set. Configure servers to connect to using the GREMLIN_SERVERS environment variable.")
-			return
-		}
-		servers, err = SplitServers(connString)
+		connString = strings.TrimSpace(os.Getenv("GREMLIN_SERVERS"))
+	} else {
+		connString = strings.Join(s, ",")
+	}
+	if connString == "" {
+		err = NoServersSetError
 		return
 	}
-	// Else use the supplied servers
-	for _, v := range s {
-		var u *url.URL
-		if u, err = url.Parse(v); err != nil {
-			return
-		}
-		servers = append(servers, u)
-	}
-	return
-}
-
-
-
-func CreateConnection() (conn net.Conn, server *url.URL, err error) {
-	connEstablished := false
-	for _, s := range servers {
-		c, err := net.DialTimeout("tcp", s.Host, 1*time.Second)
-		if err != nil {
-			continue
-		}
-		connEstablished = true
-		conn = c
-		server = s
-		break
-	}
-	if !connEstablished {
-		err = errors.New("Could not establish connection. Please check your connection string and ensure at least one server is up.")
-	}
+	defaultClient, err = NewClient(connString)
 	return
 }
