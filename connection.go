@@ -4,25 +4,19 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"github.com/gorilla/websocket"
 	"github.com/jessicacglenn/pool"
-
-	"sync"
 )
 
 // Clients include the necessary info to connect to the server and the underlying socket
 type Client struct {
 	Remote 		*url.URL
-	servchan	chan *sync.Map
 	pool		pool.Pool
-	endpointmap	*sync.Map
-	mu			*sync.RWMutex
 	Auth   		[]OptAuth
-
+	factory		*EndpointFactory
 }
 
 
@@ -40,15 +34,14 @@ var (
 // we will be able to use this for both the
 func NewClient(urlStr string, options ...OptAuth) (*Client, error) {
 
-	em, ec, err := newEndpointsChannel(urlStr)
+	fact, err := NewEndpointFactory(urlStr)
 	if err != nil {
 		return nil, err
 	}
 
-	c := &Client{Auth: options, endpointmap: em, servchan: ec, mu: &sync.RWMutex{}}
+	c := &Client{Auth: options, factory: fact}
 
-	factory    := func() (*websocket.Conn, error) { return c.connectSocket(ec) }
-	p, err := pool.NewChannelPool(1, 30, factory)
+	p, err := pool.NewChannelPool(1, 30, fact.connectSocket)
 	if err != nil {
 		return nil, err
 	}
@@ -61,29 +54,6 @@ func NewClient(urlStr string, options ...OptAuth) (*Client, error) {
 
 // if the server is not reachable then we should mark it as unavailable
 // and then try again a little later.
-
-func (c *Client) connectSocket(ch chan *sync.Map) (*websocket.Conn, error) {
-	// lock the client while finding the endpoint
-	//c.mu.Lock()
-	endpoint, err := findValidEndpoint(ch, c.mu)
-	//c.mu.Unlock()
-
-	if err != nil {
-		return nil, err
-	}
-	urlStr, err := urlStrForEndpoint(endpoint)
-	if err != nil {
-		return nil, err
-	}
-	dialer := websocket.Dialer{}
-	ws, _, err := dialer.Dial(urlStr, http.Header{})
-	if err != nil {
-		putEndpointOnIce(endpoint)
-		return c.connectSocket(ch)
-	}
-	return ws, err
-}
-
 
 func (c *Client) Close() {
 	c.pool.Close()
@@ -113,10 +83,23 @@ func (c *Client) executeForConn(req *Request, con *pool.PoolConn) ([]byte, error
 		print("error", err)
 		return nil, err
 	}
-	return c.ReadResponse(con)
+	b, err := c.readResponse(con)
+
+	// update the endpoint to mark success/error, this allows us to back off endpoints that are continuing to fail
+	if err != nil {
+		c.factory.failedEndpoint(con)
+	} else {
+		c.factory.successfulEndpoint(con)
+	}
+
+	// if the request was successful, return to the pool, otherwise close and remove from the pool.
+	err = con.Close()
+	return b, err
 }
 
-func (c *Client) ReadResponse(con *pool.PoolConn) (data []byte, err error) {
+
+// this doesn't seem to be useful outside of the Exec function (in this context)
+func (c *Client) readResponse(con *pool.PoolConn) (data []byte, err error) {
 	// Data buffer
 	var message []byte
 	var dataItems []json.RawMessage
@@ -133,13 +116,11 @@ func (c *Client) ReadResponse(con *pool.PoolConn) (data []byte, err error) {
 		var items []json.RawMessage
 		switch res.Status.Code {
 		case StatusNoContent:
-			// close the connection and put it back to the pool
-			con.Close()
+
 			return
 
 		case StatusAuthenticate:
-			// close the connection and put it back to the pool
-			con.Close()
+
 			return c.authenticate(con, res.RequestId)
 		case StatusPartialContent:
 			inBatchMode = true
@@ -147,8 +128,7 @@ func (c *Client) ReadResponse(con *pool.PoolConn) (data []byte, err error) {
 				return
 			}
 			dataItems = append(dataItems, items...)
-			// close the connection and put it back to the pool
-			con.Close()
+
 
 		case StatusSuccess:
 			if inBatchMode {
@@ -160,14 +140,7 @@ func (c *Client) ReadResponse(con *pool.PoolConn) (data []byte, err error) {
 			} else {
 				data = res.Result.Data
 			}
-			val, ex := c.endpointmap.Load(con.RemoteAddr().String())
-			if ex {
-				sm := val.(*sync.Map)
-				reduceErrorScore(sm)
-			}
 
-			// close the connection and put it back to the pool
-			con.Close()
 			return
 
 		default:
@@ -176,21 +149,9 @@ func (c *Client) ReadResponse(con *pool.PoolConn) (data []byte, err error) {
 			} else {
 				err = UnknownErr
 			}
-
-			// mark the connection as unusable so that the pool has to spin a new one up
-			con.MarkUnusable()
-			con.Close()
-
-			val, ex := c.endpointmap.Load(con.RemoteAddr().String())
-			if ex {
-				sm := val.(*sync.Map)
-				putEndpointOnIce(sm)
-			}
 			return
 		}
 	}
-	// close the connection and put it back to the pool
-	con.Close()
 	return
 }
 

@@ -75,56 +75,7 @@ func SplitServers(connString string) (servers []*url.URL, err error) {
 }
 
 
-func findValidEndpoint(c chan *sync.Map, mu *sync.RWMutex) (*sync.Map, error) {
-	return selectEndpoint(c, nil, mu)
-}
 
-func selectEndpoint(c chan *sync.Map, firstid *uuid.UUID, mu *sync.RWMutex) (*sync.Map, error) {
-	// todo : this might require the sync mutex when retrieving from the channel
-	mu.Lock()
-	m := <- c
-	c <- m
-	mu.Unlock()
-	thisid, err := idForEndpoint(m)
-	if err != nil {
-		return nil, err
-	}
-	if firstid != nil && firstid.String() == thisid.String() {
-		return nil, EndpointOnIceError
-	}
-	if endpointOnIce(m) {
-		// find the next endpoint
-		eid, err := idForEndpoint(m)
-		if err != nil {
-			return nil, err
-		}
-		// put the endpoint back in the queue
-		if len(c) == 1 {
-			// if there is only one endpoint in the channel then make sure to return instead of
-			// trying recursion
-			return nil, EndpointOnIceError
-		}
-
-		// if there is only one in the queue then this won't work, and if none are available
-		// then this will freeze
-		if firstid == nil {
-			firstid = eid
-		}
-		sm, err := selectEndpoint(c, firstid, mu)
-		if err != nil {
-			return nil, err
-		}
-		if neid, err := idForEndpoint(sm); err != nil || neid == eid {
-			if err != nil {
-				return nil, err
-			} else {
-				return nil, EndpointOnIceError
-			}
-		}
-		return sm, nil
-	}
-	return m, nil
-}
 
 
 // if the endpoint keeps erroring out it will be put 'on ice' and will not be available
