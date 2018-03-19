@@ -40,7 +40,11 @@ func (f *EndpointFactory) connectSocket() (*websocket.Conn, error) {
 		return nil, err
 	}
 	dialer := websocket.Dialer{}
+	dialer.WriteBufferSize = 8192
+	dialer.ReadBufferSize = 8192
 	ws, _, err := dialer.Dial(urlStr, http.Header{})
+
+
 	if err != nil {
 		putEndpointOnIce(endpoint)
 		return f.connectSocket()

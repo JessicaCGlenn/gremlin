@@ -9,6 +9,7 @@ import (
 	"strings"
 	"github.com/gorilla/websocket"
 	"github.com/jessicacglenn/pool"
+	"fmt"
 )
 
 // Clients include the necessary info to connect to the server and the underlying socket
@@ -79,14 +80,25 @@ func (c *Client) executeForConn(req *Request, con *pool.PoolConn) ([]byte, error
 		return nil, err
 	}
 
+	// todo : remove me
+	fmt.Printf("Sending Message:\n%s\n", requestMessage)
+
 	if err := con.WriteMessage(websocket.BinaryMessage, requestMessage); err != nil {
+		// todo : remove me
 		print("error", err)
 		return nil, err
 	}
 	b, err := c.readResponse(con)
 
+	// todo : remove me
+	fmt.Printf("Receiving Response:\n%s\n", b)
+
 	// update the endpoint to mark success/error, this allows us to back off endpoints that are continuing to fail
 	if err != nil {
+
+		// todo : remove me
+		fmt.Printf("ERROR in Response:\n%s\n", err.Error())
+
 		c.factory.failedEndpoint(con)
 	} else {
 		c.factory.successfulEndpoint(con)

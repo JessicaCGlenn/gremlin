@@ -45,6 +45,9 @@ func GraphSONSerializer(req *Request) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// todo : update this so that you can have multiple versions of graphson
+	// original version: application/vnd.gremlin-v2.0+json
 	mimeType := []byte("application/vnd.gremlin-v2.0+json")
 	var mimeLen = []byte{0x21}
 	res := append(mimeLen, mimeType...)
@@ -70,7 +73,7 @@ func Query(query string) *Request {
 	req := &Request{
 		RequestId: uuid.Must(uuid.NewV4()).String(),
 		Op:        "eval",
-		Processor: "",
+		Processor: "", // used to be ""
 		Args:      args,
 	}
 	return req
